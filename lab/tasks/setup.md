@@ -29,7 +29,7 @@
     - [1.10.1. Install `Node.js`](#1101-install-nodejs)
     - [1.10.2. (UPD) Install `pnpm`](#1102-upd-install-pnpm)
   - [1.11. (UPD) Set up the `Qwen Code` (LOCAL)](#111-upd-set-up-the-qwen-code-local)
-  - [1.12. (UPD) Set up the `Qwen` API (VM)](#112-upd-set-up-the-qwen-api-vm)
+  - [1.12. (UPD) Set up the `Qwen Code` API (VM)](#112-upd-set-up-the-qwen-code-api-vm)
   - [1.13. Set up the `Autochecker` bot (`Telegram`)](#113-set-up-the-autochecker-bot-telegram)
   - [1.14. Check the setup using the `Autochecker` bot (`Telegram`)](#114-check-the-setup-using-the-autochecker-bot-telegram)
 - [2. Optional steps](#2-optional-steps)
@@ -266,9 +266,9 @@ If you can't [connect to your VM](../../wiki/vm.md#connect-to-the-vm), complete 
 
 [Set up the `Qwen Code`](../../wiki/qwen.md#set-up-the-qwen-code-local-machine).
 
-### 1.12. (UPD) Set up the `Qwen` API (VM)
+### 1.12. (UPD) Set up the `Qwen Code` API (VM)
 
-[Set up the `Qwen` API on your VM](../../wiki/qwen.md#set-up-the-qwen-code-api-remote-machine).
+[Set up the `Qwen Code` API on your VM](../../wiki/qwen.md#set-up-the-qwen-code-api-remote-machine).
 
 ### 1.13. Set up the `Autochecker` bot (`Telegram`)
 
