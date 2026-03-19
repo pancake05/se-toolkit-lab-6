@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project implements a **Documentation Agent** — a CLI tool that connects to an LLM (Qwen Code) and uses **tools** to navigate the project's documentation (wiki) and provide accurate answers with source references.
+This project implements a **System Agent** — a CLI tool that connects to an LLM (Qwen Code) and uses **tools** to navigate the project's documentation (wiki), read source code, and query the running backend API to provide accurate answers with source references.
 
 ## Architecture
 
@@ -17,7 +17,7 @@ This project implements a **Documentation Agent** — a CLI tool that connects t
 │                     agent.py                                │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
 │  │  argparse   │→ │   Settings   │→ │  Agentic Loop    │   │
-│  │  (question) │  │ (.env file)  │  │                  │   │
+│  │  (question) │  │ (.env files) │→ │                  │   │
 │  └─────────────┘  └──────────────┘  └──────────────────┘   │
 │                                              │               │
 │                    ┌─────────────────────────┴──────────┐   │
@@ -25,15 +25,20 @@ This project implements a **Documentation Agent** — a CLI tool that connects t
 │                    │  ┌────────────┐  ┌──────────────┐  │   │
 │                    │  │ read_file  │  │ list_files   │  │   │
 │                    │  └────────────┘  └──────────────┘  │   │
+│                    │  ┌────────────────────────────┐    │   │
+│                    │  │ query_api                  │    │   │
+│                    │  └────────────────────────────┘    │   │
 │                    └────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                                                │
-                                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Qwen Code API (on VM)                          │
-│         http://<vm-ip>:<port>/v1/chat/completions           │
-│         Model: qwen3-coder-plus                             │
-└─────────────────────────────────────────────────────────────┘
+                      ┌────────────────────────┼────────────────┐
+                      │                        │                │
+                      ▼                        ▼                ▼
+┌─────────────────────────────────┐ ┌──────────────────┐ ┌──────────────┐
+│     Qwen Code API (on VM)       │ │  Backend API     │ │  File System │
+│  http://<vm-ip>:<port>/v1/...   │ │ localhost:42002  │ │  (read-only) │
+│     Model: qwen3-coder-plus     │ │ LMS_API_KEY auth │ │              │
+└─────────────────────────────────┘ └──────────────────┘ └──────────────┘
 ```
 
 ## Components
@@ -45,7 +50,9 @@ This project implements a **Documentation Agent** — a CLI tool that connects t
 
 ### 2. Configuration (`pydantic-settings`)
 
-Reads from `.env.agent.secret`:
+Reads from two `.env` files for local development:
+
+**`.env.agent.secret`** — LLM provider credentials:
 
 | Variable | Description |
 |----------|-------------|
@@ -53,9 +60,18 @@ Reads from `.env.agent.secret`:
 | `LLM_API_BASE` | Base URL of the OpenAI-compatible API endpoint |
 | `LLM_MODEL` | Model name (default: `qwen3-coder-plus`) |
 
+**`.env.docker.secret`** — Backend API credentials:
+
+| Variable | Description |
+|----------|-------------|
+| `LMS_API_KEY` | API key for backend authentication (used by `query_api`) |
+| `AGENT_API_BASE_URL` | Base URL of the backend API (default: `http://localhost:42002`) |
+
+**Important:** The autochecker injects its own credentials via environment variables, so the agent must read from environment, not hardcode values.
+
 ### 3. Tools
 
-The agent has two tools for interacting with the file system:
+The agent has **three tools** for interacting with the file system and backend API:
 
 #### `read_file(path: str)`
 
@@ -64,6 +80,7 @@ Reads the contents of a file from the project repository.
 - **Parameters:** `path` — relative path from project root (e.g., `wiki/git-workflow.md`)
 - **Returns:** File contents as a string, or an error message
 - **Security:** Blocks paths that traverse outside the project directory
+- **Use case:** Reading documentation (wiki/), source code (.py files), configuration files (docker-compose.yml, Dockerfile)
 
 #### `list_files(path: str)`
 
@@ -72,6 +89,19 @@ Lists files and directories at a given path.
 - **Parameters:** `path` — relative directory path from project root (e.g., `wiki`)
 - **Returns:** Newline-separated list of entries
 - **Security:** Blocks paths that traverse outside the project directory
+- **Use case:** Discovering project structure, finding wiki files, exploring backend routers
+
+#### `query_api(method: str, path: str, body: str | None = None)`
+
+Sends an HTTP request to the backend API.
+
+- **Parameters:**
+  - `method` — HTTP method (GET, POST, PUT, DELETE, etc.)
+  - `path` — endpoint path (e.g., `/items/`, `/analytics/completion-rate`)
+  - `body` — optional JSON request body for POST/PUT requests
+- **Returns:** JSON string with `status_code` and `body` fields
+- **Authentication:** Uses `LMS_API_KEY` from environment variables (Bearer token)
+- **Use case:** Querying live data (item count, scores, analytics), checking status codes, diagnosing API errors
 
 ### 4. Agentic Loop
 
@@ -82,7 +112,8 @@ The core reasoning engine that orchestrates tool usage:
 2. Loop (max 10 iterations):
    a. Send messages + tool schemas to LLM
    b. If LLM returns tool_calls:
-      - Execute each tool
+      - Execute each tool (read_file, list_files, or query_api)
+      - For query_api: pass LMS_API_KEY for authentication
       - Append results as tool role messages
       - Continue loop
    c. If LLM returns text answer (no tool_calls):
@@ -93,10 +124,21 @@ The core reasoning engine that orchestrates tool usage:
 
 ### 5. HTTP Client (`httpx`)
 
+Two HTTP clients are used:
+
+**LLM Client:**
+
 - Sends POST requests to `{LLM_API_BASE}/chat/completions`
-- Uses Bearer token authentication
+- Uses Bearer token authentication with `LLM_API_KEY`
 - 60-second timeout
 - Handles HTTP errors gracefully
+
+**API Client (query_api):**
+
+- Sends requests to `{AGENT_API_BASE_URL}{path}`
+- Uses Bearer token authentication with `LMS_API_KEY`
+- 30-second timeout
+- Handles connection errors, timeouts, and HTTP errors
 
 ### 6. Response Formatter
 
@@ -114,10 +156,14 @@ The core reasoning engine that orchestrates tool usage:
 ## Data Flow
 
 1. **Input**: User provides question as CLI argument
-2. **Config Load**: Agent reads `.env.agent.secret`
+2. **Config Load**: Agent reads `.env.agent.secret` (LLM credentials) and `.env.docker.secret` (backend API key)
 3. **Agentic Loop**:
-   - Send question + tool definitions to LLM
-   - LLM decides which tools to call
+   - Send question + tool schemas to LLM
+   - LLM decides which tools to call based on question type:
+     - Wiki/documentation questions → `list_files` + `read_file`
+     - System facts (framework, ports) → `read_file` for source code
+     - Data queries (item count, scores) → `query_api`
+     - Bug diagnosis → `query_api` for error, then `read_file` for source code
    - Execute tools, feed results back
    - Repeat until LLM provides final answer
 4. **Output**: Print structured JSON to stdout
@@ -190,25 +236,35 @@ This ensures:
 
 The system prompt instructs the LLM to:
 
-1. Use `list_files` to discover wiki structure
-2. Use `read_file` to read relevant documentation
-3. Include a `source` reference in the final answer (file path + section anchor)
-4. Format the answer as JSON with `answer` and `source` fields
+1. **Identify question type** and choose appropriate tools:
+   - Wiki/documentation questions → `list_files` + `read_file`
+   - System facts (framework, ports) → `read_file` for source code/configs
+   - Data queries (item count, scores, status codes) → `query_api`
+   - Bug diagnosis → `query_api` for error, then `read_file` for source code
+2. **Execute tools iteratively** until enough information is gathered
+3. **Include a `source` reference** in the final answer:
+   - File path for wiki/code questions (e.g., `wiki/git-workflow.md#section`)
+   - `api` for data queries from backend
+   - `general` for questions not about the project
+4. **Format the answer as JSON** with `answer` and `source` fields
 
 Example prompt:
 
 ```
-Вы — Documentation Agent, помогающий пользователям находить информацию в документации проекта.
+Вы — System Agent, помогающий пользователям находить информацию в проекте.
 
-У вас есть два инструмента:
-1. list_files(path) —列出 файлы в директории
-2. read_file(path) — прочитать содержимое файла
+У вас есть три инструмента:
+1. list_files(path) —列出 файлы в директории проекта
+2. read_file(path) — прочитать содержимое файла из проекта
+3. query_api(method, path, body) — отправить HTTP запрос к backend API
 
-Порядок работы:
-1. Используйте list_files для навигации по структуре проекта
-2. Используйте read_file для чтения содержимого файлов
-3. Найдите точный раздел, отвечающий на вопрос пользователя
-4. В ответе укажите source: путь к файлу и якорь раздела
+Когда какой инструмент использовать:
+- list_files: для навигации по структуре проекта (wiki/, backend/, и т.д.)
+- read_file: для чтения документации (wiki/), исходного кода (.py файлы), конфигурации
+- query_api: для получения данных из running backend системы:
+  - Количество items в базе данных: GET /items/
+  - Статус коды ответов: запросы к API без авторизации
+  - Analytics данные: /analytics/* endpoints
 ```
 
 ## LLM Provider
@@ -231,12 +287,16 @@ Example prompt:
 ### Prerequisites
 
 1. Set up Qwen Code API on your VM (see [`wiki/qwen.md`](wiki/qwen.md))
-2. Configure `.env.agent.secret`:
+2. Configure `.env.agent.secret` and `.env.docker.secret`:
 
    ```bash
+   # .env.agent.secret — LLM credentials
    LLM_API_KEY=your-api-key
    LLM_API_BASE=http://<vm-ip>:<port>/v1
    LLM_MODEL=qwen3-coder-plus
+
+   # .env.docker.secret — Backend API key
+   LMS_API_KEY=my-secret-api-key
    ```
 
 ### Usage
@@ -244,6 +304,9 @@ Example prompt:
 ```bash
 # Basic usage
 uv run agent.py "How do you resolve a merge conflict?"
+
+# Query API for data
+uv run agent.py "How many items are in the database?"
 
 # With help
 uv run agent.py --help
@@ -262,26 +325,58 @@ Tests verify:
 - `agent.py` runs successfully
 - Output is valid JSON
 - Required fields (`answer`, `source`, `tool_calls`) are present
-- Tools are called correctly for documentation questions
+- Tools are called correctly for each question type
 
 ## Project Structure
 
 ```
 se-toolkit-lab-6/
-├── agent.py              # Main CLI agent with agentic loop
-├── .env.agent.secret     # LLM configuration (gitignored)
-├── AGENT.md              # This file — architecture documentation
+├── agent.py                  # Main CLI agent with agentic loop
+├── .env.agent.secret         # LLM configuration (gitignored)
+├── .env.docker.secret        # Backend API key (gitignored)
+├── AGENT.md                  # This file — architecture documentation
 ├── plans/
-│   └── task-2.md         # Implementation plan for Documentation Agent
+│   ├── task-2.md             # Implementation plan for Documentation Agent
+│   └── task-3.md             # Implementation plan for System Agent
 ├── tests/
-│   └── test_agent.py     # Regression tests
-└── wiki/
-    ├── qwen.md           # Qwen Code setup instructions
-    └── git-workflow.md   # Example documentation
+│   └── test_agent.py         # Regression tests (5 tests)
+├── wiki/
+│   ├── qwen.md               # Qwen Code setup instructions
+│   └── git-workflow.md       # Example documentation
+└── backend/
+    └── app/
+        ├── main.py           # FastAPI backend entry point
+        └── routers/          # API route handlers
 ```
 
-## Future Extensions (Task 3)
+## Lessons Learned (Task 3)
 
-- **Backend Integration**: Add `query_api` tool to query the LMS backend
-- **Domain Knowledge**: Answer questions about courses, students, grades
-- **Multi-hop Reasoning**: Chain multiple tool calls for complex queries
+### Key Insights
+
+1. **Two distinct API keys**: `LLM_API_KEY` (in `.env.agent.secret`) authenticates with the LLM provider, while `LMS_API_KEY` (in `.env.docker.secret`) authenticates with the backend API. Mixing them up causes authentication failures.
+
+2. **Environment variable loading**: The agent must read from both `.env.agent.secret` and `.env.docker.secret` for local development, but the autochecker injects its own values via environment variables. Using `load_env_file()` with fallback to environment ensures both modes work.
+
+3. **Tool description clarity**: The LLM needs clear guidance on when to use each tool. Vague descriptions lead to wrong tool selection (e.g., using `read_file` for data queries).
+
+4. **Error handling in query_api**: The backend might be unavailable during testing. Proper error handling (connection errors, timeouts) prevents crashes and provides useful feedback.
+
+5. **Source extraction**: For API queries, the source should be "api" rather than a file path. The `extract_source_from_answer()` function was updated to handle this.
+
+### Benchmark Results
+
+Initial score: _/10 (to be filled after first run)
+
+First failures:
+
+- [ ] ...
+
+Iteration strategy:
+
+1. Fix tool descriptions if LLM calls wrong tool
+2. Fix tool implementation if errors occur
+3. Adjust system prompt for clarity
+
+### Final Eval Score
+
+_ /10 (to be updated after passing all tests)

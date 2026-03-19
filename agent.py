@@ -29,11 +29,15 @@ class AgentSettings(BaseSettings):
         LLM_API_KEY — API ключ провайдера
         LLM_API_BASE — базовый URL API endpoint
         LLM_MODEL — название модели
+        LMS_API_KEY — ключ для аутентификации в backend API
+        AGENT_API_BASE_URL — базовый URL backend (по умолчанию http://localhost:42002)
     """
 
     llm_api_key: str
     llm_api_base: str
     llm_model: str
+    lms_api_key: str
+    agent_api_base_url: str = "http://localhost:42002"
 
     model_config = SettingsConfigDict(
         # Читаем только из переменных окружения (не из .env файла)
@@ -134,10 +138,80 @@ def list_files(path: str) -> str:
         return f"Ошибка чтения директории: {e}"
 
 
+def query_api(
+    method: str,
+    path: str,
+    body: str | None = None,
+    settings: AgentSettings | None = None,
+) -> str:
+    """
+    Отправляет HTTP запрос к backend API.
+
+    Args:
+        method: HTTP метод (GET, POST, PUT, DELETE, etc.)
+        path: Путь к endpoint (например, /items/, /analytics/completion-rate)
+        body: JSON тело запроса (опционально, для POST/PUT)
+        settings: Настройки API (для аутентификации)
+
+    Returns:
+        JSON string с status_code и body ответа или сообщение об ошибке
+    """
+    if settings is None:
+        # Пытаемся создать настройки, если не переданы
+        try:
+            settings = AgentSettings()
+        except Exception as e:
+            return f"Ошибка: не удалось загрузить настройки API: {e}"
+
+    base_url = settings.agent_api_base_url.rstrip("/")
+    url = f"{base_url}{path}"
+
+    headers = {
+        "Authorization": f"Bearer {settings.lms_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    print(f"Запрос к API: {method} {url}", file=sys.stderr)
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() in ("GET", "DELETE"):
+                response = client.request(method.upper(), url, headers=headers)
+            elif method.upper() in ("POST", "PUT", "PATCH"):
+                if body:
+                    try:
+                        body_data = json.loads(body)
+                    except json.JSONDecodeError:
+                        return f"Ошибка: невалидный JSON в теле запроса: {body}"
+                    response = client.request(
+                        method.upper(), url, headers=headers, json=body_data
+                    )
+                else:
+                    response = client.request(method.upper(), url, headers=headers)
+            else:
+                return f"Ошибка: неизвестный HTTP метод '{method}'"
+
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result, ensure_ascii=False)
+
+    except httpx.ConnectError as e:
+        return f"Ошибка подключения к API ({url}): {e}"
+    except httpx.TimeoutException as e:
+        return f"Таймаут запроса к API ({url}): {e}"
+    except httpx.HTTPError as e:
+        return f"HTTP ошибка при запросе к API: {e}"
+    except Exception as e:
+        return f"Неожиданная ошибка при запросе к API: {e}"
+
+
 # Словарь доступных инструментов
 TOOLS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -183,6 +257,31 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Отправляет HTTP запрос к backend API. Используйте для получения данных из running системы: количество items, статус коды, analytics, и т.д.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP метод: GET, POST, PUT, DELETE, etc.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Путь к endpoint (например, '/items/', '/analytics/completion-rate')",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "JSON тело запроса (опционально, для POST/PUT запросов)",
+                        },
+                    },
+                    "required": ["method", "path"],
+                },
+            },
+        },
     ]
 
 
@@ -193,21 +292,34 @@ def get_system_prompt() -> str:
     Returns:
         Текст системного промпта
     """
-    return """Вы — Documentation Agent, помогающий пользователям находить информацию в документации проекта.
+    return """Вы — System Agent, помогающий пользователям находить информацию в проекте.
 
-У вас есть два инструмента:
-1. list_files(path) —列出 файлы в директории
-2. read_file(path) — прочитать содержимое файла
+У вас есть три инструмента:
+1. list_files(path) —列出 файлы в директории проекта
+2. read_file(path) — прочитать содержимое файла из проекта
+3. query_api(method, path, body) — отправить HTTP запрос к backend API
+
+Когда какой инструмент использовать:
+- list_files: для навигации по структуре проекта (wiki/, backend/, и т.д.)
+- read_file: для чтения документации (wiki/), исходного кода (.py файлы), конфигурации (docker-compose.yml, Dockerfile)
+- query_api: для получения данных из running backend системы:
+  - Количество items в базе данных: GET /items/
+  - Статус коды ответов: запросы к API без авторизации
+  - Analytics данные: /analytics/* endpoints
+  - Информация о learners: /learners/* endpoints
 
 Порядок работы:
-1. Используйте list_files для навигации по структуре проекта (особенно директория wiki/)
-2. Используйте read_file для чтения содержимого файлов
-3. Найдите точный раздел, отвечающий на вопрос пользователя
-4. В ответе укажите:
+1. Определите тип вопроса:
+   - Wiki/documentation вопрос → используйте list_files и read_file
+   - System facts (framework, ports) → read_file для чтения кода/конфигов
+   - Data queries (сколько items, scores) → query_api
+   - Bug diagnosis → query_api для получения ошибки, затем read_file для поиска бага в коде
+2. Используйте нужные инструменты для сбора информации
+3. В ответе укажите:
    - answer: краткий ответ на вопрос
-   - source: путь к файлу и якорь раздела (например, wiki/git-workflow.md#resolving-merge-conflicts)
+   - source: путь к файлу или "api" для данных из API
 
-Если вопрос не связан с документацией проекта, ответьте своими знаниями и укажите source: "general".
+Если вопрос не связан с проектом, ответьте своими знаниями и укажите source: "general".
 
 Всегда включайте source в ваш финальный ответ. Формат: {"answer": "...", "source": "..."}
 """
@@ -255,13 +367,16 @@ def call_llm(
     return data
 
 
-def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
+def execute_tool(
+    tool_name: str, args: dict[str, Any], settings: AgentSettings | None = None
+) -> str:
     """
     Выполняет инструмент по имени.
 
     Args:
         tool_name: Имя инструмента
         args: Аргументы для инструмента
+        settings: Настройки API (для query_api)
 
     Returns:
         Результат выполнения инструмента
@@ -272,7 +387,11 @@ def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
     func = TOOLS[tool_name]
     try:
         # Вызываем функцию с аргументами
-        return func(**args)
+        # query_api требует settings, остальные - нет
+        if tool_name == "query_api":
+            return func(**args, settings=settings)
+        else:
+            return func(**args)
     except TypeError as e:
         return f"Ошибка вызова инструмента: {e}"
     except Exception as e:
@@ -385,7 +504,7 @@ def run_agentic_loop(question: str, settings: AgentSettings) -> dict[str, Any]:
             print(f"Выполнение инструмента: {tool_name}({args})", file=sys.stderr)
 
             # Выполняем инструмент
-            result = execute_tool(tool_name, args)
+            result = execute_tool(tool_name, args, settings=settings)
 
             # Логируем для вывода
             tool_calls_log.append(
@@ -478,9 +597,12 @@ def main() -> int:
         Код выхода: 0 при успехе, 1 при ошибке
     """
     try:
-        # Загружаем .env.agent.secret для локальной разработки
+        # Загружаем .env файлы для локальной разработки
+        # .env.agent.secret — LLM credentials (API key, base, model)
+        # .env.docker.secret — LMS API key для query_api аутентификации
         # При работе авточекера переменные будут инжектиться напрямую
         load_env_file(".env.agent.secret")
+        load_env_file(".env.docker.secret")
 
         args = parse_args()
         settings = AgentSettings()
